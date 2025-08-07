@@ -73,6 +73,148 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
 /**
+ * Vectorized Memory Operations for MoE GEMM Kernels
+ *
+ * This section implements optimized vectorized load and store operations for different data types
+ * to maximize memory bandwidth utilization in CUDA kernels. The implementation uses:
+ *
+ * 1. PTX assembly instructions for direct hardware access to global memory
+ * 2. Template specialization based on data type bit width (64-bit, 128-bit, or scalar)
+ * 3. Type conversion utilities to handle different precision formats
+ *
+ * Key functions:
+ * - vectorizedLoadPtx: Direct PTX assembly for loading float4/float2 from global memory
+ * - vectorizedStorePtx: Direct PTX assembly for storing float4/float2 to global memory
+ * - vectorizedLoad: Template function that selects appropriate load method based on data type
+ * - vectorizedStore: Template function that selects appropriate store method based on data type
+ *
+ * These operations are critical for achieving optimal performance in MoE (Mixture of Experts)
+ * GEMM operations by ensuring coalesced memory access patterns and maximizing memory throughput.
+ */
+__device__ uint4 vectorizedLoadPtx(uint4 const* ptr)
+{
+    uint4 ret;
+    asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+                 : "l"(ptr));
+    return ret;
+}
+
+__device__ uint2 vectorizedLoadPtx(uint2 const* ptr)
+{
+    uint2 ret;
+    asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l"(ptr));
+    return ret;
+}
+
+__device__ void vectorizedStorePtx(uint4* ptr, uint4 const value)
+{
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+}
+
+__device__ void vectorizedStorePtx(uint2* ptr, uint2 const value)
+{
+    asm volatile("st.global.v2.u32 [%0], {%1, %2};" : : "l"(ptr), "r"(value.x), "r"(value.y));
+}
+
+template <typename T>
+union NumericBitcast4
+{
+    uint4 as_uint4;
+    T as_T;
+
+    __device__ __host__ NumericBitcast4(uint4 const input)
+        : as_uint4(input)
+    {
+    }
+
+    __device__ __host__ NumericBitcast4(T const input)
+        : as_T(input)
+    {
+    }
+
+    __device__ __host__ T to_T() const
+    {
+        return as_T;
+    }
+
+    __device__ __host__ uint4 to_uint4() const
+    {
+        return as_uint4;
+    }
+};
+
+template <typename T>
+union NumericBitcast2
+{
+    uint2 as_uint2;
+    T as_T;
+
+    __device__ __host__ NumericBitcast2(uint2 const input)
+        : as_uint2(input)
+    {
+    }
+
+    __device__ __host__ NumericBitcast2(T const input)
+        : as_T(input)
+    {
+    }
+
+    __device__ __host__ T to_T() const
+    {
+        return as_T;
+    }
+
+    __device__ __host__ uint2 to_uint2() const
+    {
+        return as_uint2;
+    }
+};
+
+template <class T>
+__device__ T vectorizedLoad(T const* dest)
+{
+    int constexpr BITS = cutlass::sizeof_bits<T>::value;
+    if constexpr (BITS == 128)
+    {
+        NumericBitcast4<T> in(vectorizedLoadPtx(reinterpret_cast<uint4 const*>(dest)));
+        return in.to_T();
+    }
+    else if constexpr (BITS == 64)
+    {
+        NumericBitcast2<T> in(vectorizedLoadPtx(reinterpret_cast<uint2 const*>(dest)));
+        return in.to_T();
+    }
+    else
+    {
+        return dest[0];
+    }
+}
+
+template <class T>
+__device__ void vectorizedStore(T* dest, T value)
+{
+    int constexpr BITS = cutlass::sizeof_bits<T>::value;
+
+    if constexpr (BITS == 128)
+    {
+        NumericBitcast4<T> out(value);
+        vectorizedStorePtx(reinterpret_cast<uint4*>(dest), out.to_uint4());
+    }
+    else if constexpr (BITS == 64)
+    {
+        NumericBitcast2<T> out(value);
+        vectorizedStorePtx(reinterpret_cast<uint2*>(dest), out.to_uint2());
+    }
+    else
+    {
+        dest[0] = value;
+    }
+}
+
+/**
  * Takes the input maps and prepares the expanded maps for min latency
  * @param num_active_experts_per_node: Number of active experts on current node
  * @param experts_to_token_scores: The score of each token for each activated expert. 0 if the expert is not chosen by
@@ -1539,7 +1681,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
 
             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
             {
-                auto in_vec = source_row_ptr[elem_index];
+                /// auto in_vec = source_row_ptr[elem_index];
+                DataElem in_vec = vectorizedLoad<DataElem>(source_row_ptr + elem_index);
                 if constexpr (need_nvfp4_quant || need_mxfp8_quant)
                 {
                     auto res = quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem, VecSize>(
@@ -1549,14 +1692,16 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                                  : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
                     static_assert(
                         sizeof(res) == sizeof(*dest_row_ptr), "Quantized value must be the same size as the output");
-                    dest_row_ptr[elem_index] = res;
+                    // dest_row_ptr[elem_index] = res;
+                    vectorizedStore<OutputElem>(dest_row_ptr + elem_index, res);
                 }
                 else
                 {
                     assert(act_scale_idx == 0 && "Cannot use per-expert act scale for pre-quantized activations");
                     writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row, permuted_row,
                         elem_index, padded_hidden_size, fc1_act_sf_flat, input_sf);
-                    dest_row_ptr[elem_index] = in_vec;
+                    // dest_row_ptr[elem_index] = in_vec;
+                    vectorizedStore<OutputElem>(dest_row_ptr + elem_index, in_vec);
                 }
             }
 
@@ -1579,7 +1724,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 "Input and output types must be different for AWQ");
             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
             {
-                auto frag_elems = source_row_ptr[elem_index];
+                /// auto frag_elems = source_row_ptr[elem_index];
+                DataElem frag_elems = vectorizedLoad<DataElem>(source_row_ptr + elem_index);
 
                 CUTLASS_PRAGMA_UNROLL
                 for (int e = 0; e < ELEM_PER_THREAD; e++)
@@ -1587,14 +1733,17 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                     frag_elems[e] = frag_elems[e] * prequant_scales[elem_index * ELEM_PER_THREAD + e];
                 }
 
-                dest_row_ptr[elem_index] = arrayConvert<DataElem, OutputElem>(frag_elems);
+                /// dest_row_ptr[elem_index] = arrayConvert<DataElem, OutputElem>(frag_elems);
+                vectorizedStore<OutputElem>(dest_row_ptr + elem_index, arrayConvert<DataElem, OutputElem>(frag_elems));
             }
         }
         else
         {
             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
             {
-                dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+                /// dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+                auto source_elem = vectorizedLoad<DataElem>(source_row_ptr + elem_index);
+                vectorizedStore<OutputElem>(dest_row_ptr + elem_index, source_elem);
             }
         }
 
@@ -1817,19 +1966,25 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
             auto const* expanded_permuted_rows_row_ptr
                 = expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
-            ComputeElem expert_result
-                = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+            // ComputeElem expert_result
+            //     = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+            auto expert_result_in = vectorizedLoad<InputElem>(expanded_permuted_rows_row_ptr + elem_index);
+            ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_result_in);
+
             if (bias)
             {
                 auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
-                expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+                auto bias_in = vectorizedLoad<BiasElem>(bias_ptr + elem_index);
+                /// expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+                expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_in);
             }
 
             thread_output = thread_output + row_scale * expert_result;
         }
 
         OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
-        reduced_row_ptr_v[elem_index] = output_elem;
+        /// reduced_row_ptr_v[elem_index] = output_elem;
+        vectorizedStore<OutputElem>(reduced_row_ptr_v + elem_index, output_elem);
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.launch_dependents;");
@@ -2040,11 +2195,15 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
     ActFn<ComputeElem> fn{};
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
-        auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
+        auto fc1_value_in = vectorizedLoad<GemmResultElem>(gemm_result_vec + elem_index);
+        auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(fc1_value_in);
         // BF16 isn't supported, use FP32 for activation function
-        auto gate_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + inter_size_vec]);
+        auto gate_value_in = vectorizedLoad<GemmResultElem>(gemm_result_vec + elem_index + inter_size_vec);
+        auto gate_value = arrayConvert<GemmResultElem, ComputeElem>(gate_value_in);
         auto gate_act = fn(gate_value);
-        output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(fc1_value * gate_act);
+        /// output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(fc1_value * gate_act);
+        vectorizedStore<OutputElem>(
+            output_vec + elem_index, arrayConvert<ComputeElem, OutputElem>(fc1_value * gate_act));
     }
 }
 
@@ -2148,20 +2307,28 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         ActFn<ComputeElem> fn{};
         for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
         {
-            auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
+            // auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
+            auto fc1_value_in = vectorizedLoad<GemmResultElem>(gemm_result_vec + elem_index + gated_off_vec);
+            auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(fc1_value_in);
             if (bias_ptr)
             {
-                fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
+                auto bias_in = vectorizedLoad<BiasElem>(bias_ptr_vec + elem_index + gated_off_vec);
+                /// fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index +
+                /// gated_off_vec]);
+                fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(bias_in);
             }
 
             auto gate_act = fn(fc1_value);
 
             if (gated)
             {
-                auto gate_mul = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
+                auto gate_mul_in = vectorizedLoad<GemmResultElem>(gemm_result_vec + elem_index);
+                auto gate_mul = arrayConvert<GemmResultElem, ComputeElem>(gate_mul_in);
                 if (bias_ptr_vec)
                 {
-                    gate_mul = gate_mul + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+                    auto bias_in = vectorizedLoad<BiasElem>(bias_ptr_vec + elem_index);
+                    /// gate_mul = gate_mul + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+                    gate_mul = gate_mul + arrayConvert<BiasElem, ComputeElem>(bias_in);
                 }
                 gate_act = gate_act * gate_mul;
             }
@@ -2177,11 +2344,14 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                             : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
                 static_assert(
                     sizeof(res) == sizeof(*output_vec), "Quantized value must be the same size as the output");
-                output_vec[elem_index] = res;
+                /// output_vec[elem_index] = res;
+                vectorizedStore<OutputElem>(output_vec + elem_index, res);
             }
             else
             {
-                output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+                /// output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+                vectorizedStore<OutputElem>(
+                    output_vec + elem_index, arrayConvert<ComputeElem, OutputElem>(post_act_val));
             }
         }
 
@@ -2374,7 +2544,8 @@ __global__ void loraAddBiasKernel(ScaleBiasType* output, LoraType const* lora_re
     {
         auto lora_value = lora_result_1_vec[elem_index];
         auto bias_value = bias_vec[elem_index];
-        output_vec[elem_index] = bias_value + arrayConvert<DataElem, BiasElem>(lora_value);
+        /// output_vec[elem_index] = bias_value + arrayConvert<DataElem, BiasElem>(lora_value);
+        vectorizedStore<BiasElem>(output_vec + elem_index, bias_value + arrayConvert<DataElem, BiasElem>(lora_value));
     }
 
     if constexpr (IsGated)
@@ -2385,7 +2556,9 @@ __global__ void loraAddBiasKernel(ScaleBiasType* output, LoraType const* lora_re
         {
             auto lora_value = lora_result_2_vec[elem_index];
             auto bias_value = bias_vec[elem_index + inter_size_vec];
-            output_vec[elem_index + inter_size_vec] = bias_value + arrayConvert<DataElem, BiasElem>(lora_value);
+            /// output_vec[elem_index + inter_size_vec] = bias_value + arrayConvert<DataElem, BiasElem>(lora_value);
+            vectorizedStore<BiasElem>(
+                output_vec + elem_index + inter_size_vec, bias_value + arrayConvert<DataElem, BiasElem>(lora_value));
         }
     }
 }
@@ -2433,7 +2606,8 @@ __global__ void loraReorderKernel(
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
         auto lora_value = lora_result_1_vec[elem_index];
-        output_vec[elem_index] = lora_value;
+        /// output_vec[elem_index] = lora_value;
+        vectorizedStore<DataElem>(output_vec + elem_index, lora_value);
     }
 
     auto lora_result_2_vec = reinterpret_cast<DataElem const*>(lora_result_1 + num_tokens * inter_size);
@@ -2441,7 +2615,8 @@ __global__ void loraReorderKernel(
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
         auto lora_value = lora_result_2_vec[elem_index];
-        output_vec[elem_index + inter_size_vec] = lora_value;
+        /// output_vec[elem_index + inter_size_vec] = lora_value;
+        vectorizedStore<DataElem>(output_vec + elem_index + inter_size_vec, lora_value);
     }
 }
 
@@ -2495,8 +2670,11 @@ __global__ void dequantFP8Kernel(OutputType* output, InputType const* input, int
 
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
-        auto input_value = arrayConvert<DataElem, ComputeElem>(input_vec[elem_index]);
-        output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(input_value * deqaunt_scale_value);
+        auto input_value_in = vectorizedLoad<DataElem>(input_vec + elem_index);
+        auto input_value = arrayConvert<DataElem, ComputeElem>(input_value_in);
+        /// output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(input_value * deqaunt_scale_value);
+        vectorizedStore<OutputElem>(
+            output_vec + elem_index, arrayConvert<ComputeElem, OutputElem>(input_value * deqaunt_scale_value));
     }
 }
 
