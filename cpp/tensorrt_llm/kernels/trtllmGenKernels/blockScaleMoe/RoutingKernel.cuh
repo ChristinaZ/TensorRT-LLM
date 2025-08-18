@@ -378,7 +378,7 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
     // We can't do it earlier because FC1 depends on the mPtrCtaIdxXyToBatchIdx,
     // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas and mPtrTotalNumPaddedTokens
     // TODO: this is not sufficient to ensure visibility in the next kernel!
-#if !defined(PDL_PROFILE) || PDL_PROFILE == 0
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
@@ -760,12 +760,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
 // Trigger secondary kernel.
 // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
 // dependency sync.
-#if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
-#endif
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
