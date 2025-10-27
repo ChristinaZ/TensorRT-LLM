@@ -479,7 +479,7 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
 @pytest.mark.parametrize("bias", [True, False])
@@ -504,8 +504,8 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         SEQ_LEN = 4
         HIDDEN_SIZE = 64
         INTERMEDIATE_SIZE = 32
-        NUM_EXPERTS = 3
-        TOP_K = 2
+        NUM_EXPERTS = 128
+        TOP_K = 4
         routing_method = routing_cls(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)

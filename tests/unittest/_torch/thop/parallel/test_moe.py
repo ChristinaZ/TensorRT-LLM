@@ -1695,14 +1695,77 @@ class TestMoeFp4:
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 1024])
-@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
+#@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
 @pytest.mark.parametrize("use_topk_as_input", [False, True],
                          ids=["use_score_as_input", "use_topk_as_input"])
-def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
-                                  intermediate_size, use_topk_as_input):
+@pytest.mark.parametrize(
+    "routing_info",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_8"),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 4,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_4"),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3
+            },
+            id="RoutingDSv3"),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 1,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.Llama4
+            },
+            id="RoutingLlama4"),
+    ],
+)
+def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size,
+                                  intermediate_size, use_topk_as_input, routing_info):
     torch.random.manual_seed(0)
+    num_experts = routing_info["num_experts"]
+    top_k = routing_info["top_k"]
+    n_groups = routing_info["n_groups"]
+    top_k_groups = routing_info["top_k_groups"]
+    routed_scaling = routing_info["routed_scaling"]
+    routing_info["has_routing_bias"]
+    routing_method_type = routing_info["routing_method_type"]
+
+    if routing_method_type == RoutingMethodType.Llama4:
+        use_routing_scales_on_input = True
+    else:
+        use_routing_scales_on_input = False
 
     if use_topk_as_input:
         if num_tokens != 1:
@@ -1710,9 +1773,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     #
     # Data Generation
     #
-    num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
-    routed_scaling = 2.5
-    routing_method_type = RoutingMethodType.Llama4
+    # num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
+    # routed_scaling = 2.5
+    # routing_method_type = RoutingMethodType.Llama4
     tile_tokens_dim = 8
 
     assert top_k <= num_experts
@@ -1725,8 +1788,15 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         assert num_experts % n_groups == 0
         assert top_k < (top_k_groups * num_experts / n_groups)
 
-    expert_logits = torch.randn((num_tokens, num_experts),
-                                device='cuda').to(torch.float)
+    # expert_logits = torch.randn((num_tokens, num_experts),
+    #                             device='cuda').to(torch.float)
+    if routing_method_type == RoutingMethodType.DeepSeekV3 or routing_method_type == RoutingMethodType.Llama4:
+        expert_logits = torch.randn((num_tokens, num_experts),
+                                    device='cuda').to(torch.float)
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
+        expert_logits = torch.randn((num_tokens, num_experts),
+                                    device='cuda').to(torch.bfloat16)
+
     routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
 
     hidden_states = torch.randn((num_tokens, hidden_size),
@@ -1745,9 +1815,27 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     gemm2_weights_quant, gemm2_global_scales = quant_fp8_per_tensor_batches(
         gemm2_weights)
 
-    permute_info, scores = routing_reference_no_aux(
-        expert_logits, routing_bias, top_k, n_groups, top_k_groups,
-        routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
+    # permute_info, scores = routing_reference_no_aux(
+    #     expert_logits, routing_bias, top_k, n_groups, top_k_groups,
+    #     routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
+    if routing_method_type == RoutingMethodType.DeepSeekV3:
+        permute_info, scores = routing_reference_no_aux(expert_logits,
+                                                        routing_bias, top_k,
+                                                        n_groups, top_k_groups,
+                                                        routed_scaling,
+                                                        tile_tokens_dim)
+    elif routing_method_type == RoutingMethodType.Renormalize:
+        permute_info, scores = routing_reference_renormalize(
+            expert_logits, top_k, num_experts, tile_tokens_dim)
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive:
+        permute_info, scores = routing_reference_renormalize_naive(
+            expert_logits, top_k, num_experts, tile_tokens_dim)
+    elif routing_method_type == RoutingMethodType.Llama4:
+        permute_info, scores = routing_reference_no_aux(
+            expert_logits, routing_bias, top_k, n_groups, top_k_groups,
+            routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
+
+
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, tile_tokens_dim, hidden_states_quant, None,
