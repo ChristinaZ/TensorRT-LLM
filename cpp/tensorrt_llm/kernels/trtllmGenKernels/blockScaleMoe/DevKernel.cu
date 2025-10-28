@@ -517,6 +517,13 @@ __global__ void finalizeKernel(KernelParams params)
                 {
                     TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
                     data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+
+                    if (hiddenIdx == params.hiddenDim-1 || hiddenIdx == 2)
+                    {
+                        printf("tokenIdx: %d, k: %d, hiddenIdx: %d, permutedIdx: %d, scale: %f, data: %f\n", 
+                            tokenIdx, k, hiddenIdx, permutedIdx, 
+                            float{scale}, float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]});
+                    }
                 }
                 else
                 {

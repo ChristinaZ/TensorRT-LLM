@@ -450,6 +450,8 @@ def run_moe_dequant(args,
         i = (i + args.padding - 1) // args.padding * args.padding
     # Finalize
     expert_weight = args.permute_info["topKLogits"].to(torch.float)
+    print_weight=expert_weight.cpu()
+    print(f"Finalize topk_weights values:\n{print_weight}")
     finalize_output = torch.full((args.num_tokens, args.hidden_size),
                                  float('nan'),
                                  device='cuda').to(torch.float)
@@ -462,6 +464,7 @@ def run_moe_dequant(args,
             weight = expert_weight[
                 i, top_k_idx] if not args.use_routing_scales_on_input else 1.0
             acc += original_vector * weight
+            print(f"i: {i}, top_k_idx: {top_k_idx}, weight: {weight} , original_vector: {original_vector}")
         finalize_output[i] = acc
     return finalize_output
 
@@ -1903,7 +1906,13 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size,
     if use_topk_as_input:
         topk_ids = permute_info["topKIndices"].to(torch.int32).cuda()
         topk_weights = permute_info["topKLogits"].to(torch.bfloat16).cuda()
+        
+       
 
+    print_weight=permute_info["topKLogits"].to(torch.bfloat16).cpu()
+    # Print weight values
+    print(f"topk_weights values:\n{print_weight}")
+        
     AutoTuner.get().clear_cache()
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
         expert_logits.to(torch.bfloat16)

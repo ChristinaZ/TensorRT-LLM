@@ -158,6 +158,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesBlo
                 if (params.mPtrTopKWeights != nullptr)
                 {
                     params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] = OutputT{warpTopKScore[laneIdx]};
+                    printf("warpIdx: %d, laneIdx: %d, warpTopKScore: %f\n", warpIdx, laneIdx, float{warpTopKScore[laneIdx]});
                 }
             }
         } // end if (validToken)
